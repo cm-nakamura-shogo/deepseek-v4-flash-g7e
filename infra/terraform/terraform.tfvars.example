@@ -1,0 +1,16 @@
+aws_account_id = "123456789012"
+aws_region     = "ap-northeast-1"
+
+project_name = "self-hosted-llm"
+environment  = "poc"
+
+availability_zones = ["ap-northeast-1a", "ap-northeast-1c"]
+
+ecs_gpu_ami_id = "ami-017b6c4af9d973664"
+
+# Create the secret value outside Terraform and set its ARN only if the model is gated.
+# huggingface_token_secret_arn = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:..."
+
+tags = {
+  Owner = "example"
+}

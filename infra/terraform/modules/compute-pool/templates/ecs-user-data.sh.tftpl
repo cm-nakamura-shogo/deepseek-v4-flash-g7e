@@ -1,0 +1,12 @@
+#!/bin/bash
+set -euo pipefail
+
+cat <<'ECS_CONFIG' >> /etc/ecs/ecs.config
+ECS_CLUSTER=${ecs_cluster_name}
+ECS_ENABLE_GPU_SUPPORT=true
+ECS_ENABLE_TASK_IAM_ROLE=true
+ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST=true
+ECS_CONFIG
+
+mkdir -p /var/lib/llm-model-cache
+chmod 0755 /var/lib/llm-model-cache

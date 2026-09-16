@@ -1,0 +1,11 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+terraform.tfvars
+*.auto.tfvars
+!terraform.tfvars.example
+.DS_Store
+__pycache__/
