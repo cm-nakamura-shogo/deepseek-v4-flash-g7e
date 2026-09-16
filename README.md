@@ -57,49 +57,86 @@ GPUインスタンスを停止していても、NAT Gateway、Application Load B
 
 モデルの利用条件は、各配布元のライセンスを確認してください。
 
-## Terraformの準備
+## デプロイから測定まで
 
-設定例をコピーし、対象AWSアカウントの値へ変更します。
+以下の手順では、AWS認証にaws-vaultを使用します。
+aws-vaultを使わない場合は、各コマンドから`aws-vault exec "${AWS_VAULT_PROFILE}" --`を外し、AWS CLIとTerraformが認証情報を取得できる状態で実行してください。
 
-```bash
-cp infra/terraform/terraform.tfvars.example infra/terraform/terraform.tfvars
-```
+### 1. 対象AWSアカウントの設定
 
-`aws_account_id`は必須です。
-Providerと運用スクリプトは、認証中のAWSアカウントがこの値と一致しない場合に処理を中止します。
-
-```hcl
-aws_account_id = "123456789012"
-aws_region     = "ap-northeast-1"
-```
-
-初期化と検証を行います。
-
-```bash
-terraform -chdir=infra/terraform init
-terraform -chdir=infra/terraform fmt -check -recursive
-terraform -chdir=infra/terraform validate
-terraform -chdir=infra/terraform plan
-```
-
-Planに意図しない削除がないことと、料金が発生するリソースを確認してから適用します。
-
-```bash
-terraform -chdir=infra/terraform apply
-```
-
-詳しい変数と設計は[Terraform README](infra/terraform/README.md)を参照してください。
-
-## GPU環境の起動と停止
-
-スクリプトは誤ったAWSアカウントで実行しないように、`AWS_ACCOUNT_ID`の指定を要求します。
+操作対象のAWSアカウントとaws-vaultプロファイルを環境変数へ設定します。
+運用スクリプトは、認証中のAWSアカウントが`AWS_ACCOUNT_ID`と一致しない場合に処理を中止します。
 
 ```bash
 export AWS_ACCOUNT_ID="123456789012"
 export AWS_VAULT_PROFILE="your-profile"
 ```
 
-DeepSeekのGPU環境を起動します。
+Terraformの設定例をコピーします。
+
+```bash
+cp infra/terraform/terraform.tfvars.example infra/terraform/terraform.tfvars
+```
+
+作成した`terraform.tfvars`の`aws_account_id`を対象AWSアカウントへ変更します。
+
+```hcl
+aws_account_id = "123456789012"
+aws_region     = "ap-northeast-1"
+```
+
+### 2. Terraformの適用
+
+Terraformを初期化し、フォーマットと構文を検証します。
+
+```bash
+aws-vault exec "${AWS_VAULT_PROFILE}" -- \
+  terraform -chdir=infra/terraform init
+
+aws-vault exec "${AWS_VAULT_PROFILE}" -- \
+  terraform -chdir=infra/terraform fmt -check -recursive
+
+aws-vault exec "${AWS_VAULT_PROFILE}" -- \
+  terraform -chdir=infra/terraform validate
+```
+
+Planをファイルへ保存します。
+
+```bash
+aws-vault exec "${AWS_VAULT_PROFILE}" -- \
+  terraform -chdir=infra/terraform plan \
+  -out=deepseek-v4-flash.tfplan
+```
+
+Planに意図しない削除がないことと、料金が発生するリソースを確認してから適用します。
+
+```bash
+aws-vault exec "${AWS_VAULT_PROFILE}" -- \
+  terraform -chdir=infra/terraform apply \
+  deepseek-v4-flash.tfplan
+```
+
+Terraformの適用直後は、ECS ServiceとGPU Auto Scaling Groupが0台のため、GPU料金は発生しません。
+ただし、NAT GatewayやApplication Load Balancerなどは作成時点から課金対象になります。
+
+詳しい変数と設計は[Terraform README](infra/terraform/README.md)を参照してください。
+
+### 3. Internal ALBのURL取得
+
+Terraform outputからInternal ALBのURLを取得します。
+
+```bash
+export VLLM_URL="$(terraform -chdir=infra/terraform output -raw vllm_url)"
+echo "${VLLM_URL}"
+```
+
+このALBはInternalです。
+以降のAPI呼び出しは、VPC、VPN、踏み台ホストなど、ALBへ到達できるネットワークから実行してください。
+
+### 4. GPU環境の起動
+
+DeepSeekのECS Serviceを1へ変更します。
+ECS Capacity Providerが必要なEC2容量を検知し、`g7e.12xlarge`を1台起動します。
 
 ```bash
 aws-vault exec "${AWS_VAULT_PROFILE}" -- \
@@ -107,7 +144,8 @@ aws-vault exec "${AWS_VAULT_PROFILE}" -- \
   ./scripts/ecs-start.sh deepseek-v4-flash
 ```
 
-状態を確認します。
+EC2の起動、コンテナイメージの取得、約168GBのモデル取得、モデルロードが順番に行われます。
+初回起動には時間がかかるため、次のコマンドでECS Service、Auto Scaling Group、直近のECSイベントを確認します。
 
 ```bash
 aws-vault exec "${AWS_VAULT_PROFILE}" -- \
@@ -115,23 +153,24 @@ aws-vault exec "${AWS_VAULT_PROFILE}" -- \
   ./scripts/ecs-status.sh deepseek-v4-flash
 ```
 
-検証後はECS TaskとGPUインスタンスを停止します。
+`desired=1`、`running=1`、`pending=0`になった後、`/v1/models`へ接続できることを確認します。
 
 ```bash
-aws-vault exec "${AWS_VAULT_PROFILE}" -- \
-  env AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID}" \
-  ./scripts/ecs-stop.sh deepseek-v4-flash
+curl --fail --show-error \
+  -H 'X-LLM-Profile: deepseek-v4-flash' \
+  "${VLLM_URL}/v1/models"
 ```
 
-`ecs-stop.sh`はECS Serviceを0へ変更し、同じCompute Poolを使う別Serviceがない場合にAuto Scaling Groupも0へ変更します。
+ALB Targetがhealthyになるまでは`503 Service Unavailable`になる場合があります。
+その場合は`ecs-status.sh`でECSイベントを確認し、モデルロードの完了を待ってから再実行してください。
 
-## ベンチマーク
+### 5. ベンチマーク
 
 ベンチマークツールはOpenAI互換のストリーミングAPIを呼び出し、TTFT、E2E output tok/sec、Decode output tok/sec、Aggregate output tok/secを記録します。
 
 ```bash
 python3 benchmark/streaming_benchmark.py \
-  --url http://internal-alb.example/v1/chat/completions \
+  --url "${VLLM_URL}/v1/chat/completions" \
   --model nvidia/DeepSeek-V4-Flash-NVFP4 \
   --header-name X-LLM-Profile \
   --header-value deepseek-v4-flash \
@@ -147,6 +186,52 @@ python3 benchmark/streaming_benchmark.py \
 各リクエストには異なる`cache_salt`を設定するため、Prefix Cacheはリクエスト間で再利用されません。
 
 測定結果と条件は[Benchmark results](docs/benchmark-results.md)に記載しています。
+
+### 6. GPU環境の停止
+
+検証後は、ECS TaskとGPUインスタンスを停止します。
+
+```bash
+aws-vault exec "${AWS_VAULT_PROFILE}" -- \
+  env AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID}" \
+  ./scripts/ecs-stop.sh deepseek-v4-flash
+```
+
+`ecs-stop.sh`はECS Serviceを0へ変更し、同じCompute Poolを使う別Serviceがない場合にAuto Scaling Groupも0へ変更します。
+処理は、ECS Taskの停止とEC2インスタンスの終了を確認してから完了します。
+
+停止後の状態を確認します。
+
+```bash
+aws-vault exec "${AWS_VAULT_PROFILE}" -- \
+  env AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID}" \
+  ./scripts/ecs-status.sh deepseek-v4-flash
+```
+
+## 検証環境全体の削除
+
+NAT GatewayやApplication Load Balancerを含む検証環境全体を削除する場合は、すべてのServing Profileを停止します。
+
+```bash
+aws-vault exec "${AWS_VAULT_PROFILE}" -- \
+  env AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID}" \
+  ./scripts/ecs-stop.sh all
+```
+
+Destroy Planを確認してから適用します。
+
+```bash
+aws-vault exec "${AWS_VAULT_PROFILE}" -- \
+  terraform -chdir=infra/terraform plan \
+  -destroy \
+  -out=deepseek-v4-flash-destroy.tfplan
+
+aws-vault exec "${AWS_VAULT_PROFILE}" -- \
+  terraform -chdir=infra/terraform apply \
+  deepseek-v4-flash-destroy.tfplan
+```
+
+削除後は、AWSコンソールまたはCost Explorerで想定外のリソースと料金が残っていないことを確認してください。
 
 ## テスト
 
